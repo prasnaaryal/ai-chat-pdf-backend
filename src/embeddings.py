@@ -3,7 +3,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 
 class EmbeddingManager:
-    def __init__(self, embedded_model="BAAI/bge-large-en-v1.5"):
+    def __init__(self, embedded_model="BAAI/bge-small-en"):
         self.embedded_model = embedded_model
         self.embed_model = HuggingFaceEmbedding(model_name=self.embedded_model)
 
