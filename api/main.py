@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import boto3
+from botocore.config import Config
 from io import BytesIO
 from typing import List
 from typing import Dict
@@ -133,6 +134,7 @@ def get_docs_to_add_vectorstore(pages: List[str], file: str):
 
 S3_CLIENT = boto3.client(
     's3',
+    config=Config(signature_version='s3v4'),
     region_name='ap-southeast-1',  # Specify your region
     aws_access_key_id='AKIAS6ZMFNZVXTOBUFH4',  # Replace with your access key ID
     aws_secret_access_key='3vw0HcrRb1MWTnTUFCymw/t/HcCl9OFgiMyUAvKW'  # Replace with your secret access key
@@ -164,21 +166,22 @@ class PresignedUrlRequest(BaseModel):
 
 class PresignedUrlResponse(BaseModel):
     url: str
-    fields: Dict[str, str]
+    key: str
 
 @app.post("/generate-presigned-url/")
 async def generate_presigned_url(request: PresignedUrlRequest) -> PresignedUrlResponse:
     try:
+        key = f"uploads/{request.filename}"
         # Generate a pre-signed URL for uploading
-        response = S3_CLIENT.generate_presigned_post(
-            Bucket=S3_BUCKET_NAME,
-            Key=f"uploads/{request.filename}",
-            ExpiresIn=3600  # URL expiration time in seconds
+        response = S3_CLIENT.generate_presigned_url(
+            'put_object',
+            Params={'Bucket': S3_BUCKET_NAME, 'Key': key},
+            ExpiresIn=3600,  # URL expiration time in seconds
         )
 
         return PresignedUrlResponse(
-                   url=response['url'],
-                   fields=response['fields']
+            url=response,
+            key=key
         )
 
     except Exception as e:
