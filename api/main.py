@@ -1,10 +1,11 @@
 import os
 import json
 import uuid
+import boto3
 from io import BytesIO
 from typing import List
+from typing import Dict
 
-from api import req
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 from PyPDF2 import PdfReader
@@ -21,9 +22,23 @@ from fastapi.encoders import jsonable_encoder
 from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 from langchain.schema import Document
+from fastapi.middleware.cors import CORSMiddleware
+from starlette import status
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.types import ASGIApp
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError
+from pydantic import BaseModel
+from fastapi import Request, HTTPException, Depends, Query
 
-
-from .db import SessionLocal
+from db import SessionLocal, engine
+from models import Base, ChatHistory, Chat
+from req  import ConversationRequest
 
 def get_db():
     db = SessionLocal()
@@ -37,9 +52,7 @@ load_dotenv()
 google_api_key = os.getenv("GOOGLE_API_KEY")
 
 # Initialize FastAPI app
-from .db import SessionLocal, engine
-from .models import Base, ChatHistory, Chat
-from fastapi.middleware.cors import CORSMiddleware
+
 
 # Create all tables
 Base.metadata.create_all(bind=engine)
@@ -117,16 +130,80 @@ def get_docs_to_add_vectorstore(pages: List[str], file: str):
     return documents, ids, metadatas, embeddings
 
 
-@app.post("/chat/")
-async def new_chat(db: Session = Depends(get_db), files: List[UploadFile] = File(...)):
+
+S3_CLIENT = boto3.client(
+    's3',
+    region_name='ap-southeast-1',  # Specify your region
+    aws_access_key_id='AKIAS6ZMFNZVXTOBUFH4',  # Replace with your access key ID
+    aws_secret_access_key='3vw0HcrRb1MWTnTUFCymw/t/HcCl9OFgiMyUAvKW'  # Replace with your secret access key
+)
+
+S3_BUCKET_NAME="pdfchat-thesis"
+
+
+def upload_to_s3(file: UploadFile, bucket: str) -> str:
     try:
-        # Read the PDF files and extract text
-        pdf_files = [BytesIO(await file.read()) for file in files]
-        raw_text = get_pdf_text(pdf_files)
+        file_content = file.file.read()
+        file_key = f"uploads/{file.filename}"
+        S3_CLIENT.put_object(Bucket=bucket, Key=file_key, Body=file_content)
+        return file_key
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        raise Exception(f"S3 upload error: {str(e)}")
+
+def get_file_from_s3(file_key: str) -> BytesIO:
+    try:
+        response = S3_CLIENT.get_object(Bucket=S3_BUCKET_NAME, Key=file_key)
+        return BytesIO(response['Body'].read())
+    except Exception as e:
+        raise Exception(f"S3 retrieval error: {str(e)}")
+
+
+class PresignedUrlRequest(BaseModel):
+    filename: str
+    content_type: str
+
+class PresignedUrlResponse(BaseModel):
+    url: str
+    fields: Dict[str, str]
+
+@app.post("/generate-presigned-url/")
+async def generate_presigned_url(request: PresignedUrlRequest) -> PresignedUrlResponse:
+    try:
+        # Generate a pre-signed URL for uploading
+        response = S3_CLIENT.generate_presigned_post(
+            Bucket=S3_BUCKET_NAME,
+            Key=f"uploads/{request.filename}",
+            ExpiresIn=3600  # URL expiration time in seconds
+        )
+
+        return PresignedUrlResponse(
+                   url=response['url'],
+                   fields=response['fields']
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating pre-signed URL: {str(e)}")
+
+
+@app.post("/chat/")
+async def new_chat(
+    request: Request,
+    db: Session = Depends(get_db),
+    file_key: str = Query(..., description="The key of the file in S3 bucket")
+):
+    try:
+        # Retrieve and process files from S3
+        pdf_file_content = get_file_from_s3(file_key)
+
+        # Assuming get_pdf_text can handle raw file content
+        raw_text = get_pdf_text([pdf_file_content])
         text_chunks = get_text_chunks(raw_text)
 
+        # Use the file_key to derive the filename if needed
+        filename = file_key.split('/')[-1]
+
         # Add data to Chroma DB
-        documents, ids, metadatas, embeddings = get_docs_to_add_vectorstore(text_chunks, files[0].filename)
+        documents, ids, metadatas, embeddings = get_docs_to_add_vectorstore(text_chunks, filename)
         collection.add(
             documents=documents,
             embeddings=embeddings,
@@ -135,7 +212,7 @@ async def new_chat(db: Session = Depends(get_db), files: List[UploadFile] = File
         )
 
         # Create and save a new ChatHistory record
-        chat_history = ChatHistory(title=files[0].filename, context=raw_text)
+        chat_history = ChatHistory(title=filename, context=raw_text)
         db.add(chat_history)
         db.commit()
         db.refresh(chat_history)
@@ -167,7 +244,7 @@ async def get_chats(db: Session = Depends(get_db)):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.post("/conversation/")
-async def talk_with_gpt(question: req.ConversationRequest, db: Session = Depends(get_db)):
+async def talk_with_gpt(question: ConversationRequest, db: Session = Depends(get_db)):
     try:
         # Retrieve the chat history using chat_id
         chat_history = db.query(ChatHistory).filter(ChatHistory.id == question.chat_id).first()
